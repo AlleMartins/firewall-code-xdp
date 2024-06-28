@@ -1,0 +1,8 @@
+{'time_s': 0.0, 'comm': 'mimetype', 'pid': 9601, 'filename': '/var/log/auth.log'}
+{'time_s': 1.036519256, 'comm': 'pool-gnome-text', 'pid': 9689, 'filename': '/var/log/auth.log'}
+{'time_s': 5.512276613, 'comm': 'pool-gnome-text', 'pid': 9689, 'filename': '/var/log/auth.log'}
+{'time_s': 5.512337292, 'comm': 'pool-gnome-text', 'pid': 9689, 'filename': '/var/log/auth.log'}
+{'time_s': 15.971386235, 'comm': 'mimetype', 'pid': 9954, 'filename': '/var/log/auth.log'}
+{'time_s': 16.889224144, 'comm': 'pool-gnome-text', 'pid': 10042, 'filename': '/var/log/auth.log'}
+{'time_s': 18.951345269, 'comm': 'pool-gnome-text', 'pid': 10042, 'filename': '/var/log/auth.log'}
+{'time_s': 18.951409014, 'comm': 'pool-gnome-text', 'pid': 10042, 'filename': '/var/log/auth.log'}
