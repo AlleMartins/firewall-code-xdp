@@ -11,7 +11,7 @@ bpf_text = """
 #include <linux/ip.h>
 #include <linux/tcp.h>
 
-#define MAX_REQUESTS 5000
+#define MAX_REQUESTS 100000
 
 __attribute__((section("xdp"), used))
 int xdp_firewall(struct xdp_md *ctx);
@@ -50,6 +50,9 @@ int xdp_firewall(struct xdp_md *ctx) {
         // Increment the request count
         (*req_count)++;
         if (*req_count > MAX_REQUESTS) {
+            
+            bpf_trace_printk("Blocked IP: %x\\n", src_ip);
+
             // Drop the packet if request limit is exceeded
             return XDP_DROP;
         }
