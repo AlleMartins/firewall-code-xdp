@@ -1,68 +1,81 @@
 from bcc import BPF
 import socket
 import struct
+import ctypes as ct
 
 # Carica il codice eBPF
 bpf_text = """
 #include <uapi/linux/bpf.h>
-#include <uapi/linux/in.h>
-#include <linux/ptrace.h>
-#include <linux/tcp.h>
-#include <linux/inet.h>
-#include <net/sock.h>
-#include <bcc/proto.h>
+#include <linux/in.h>
+#include <linux/if_ether.h>
 #include <linux/ip.h>
+#include <linux/tcp.h>
 
-#define THRESHOLD 10
+#define MAX_REQUESTS 5000
 
-struct ip_key_t {
-    u32 src_ip;
-};
+__attribute__((section("xdp"), used))
+int xdp_firewall(struct xdp_md *ctx);
 
-BPF_HASH(counts, struct ip_key_t, u32);
-BPF_PERF_OUTPUT(events);
-BPF_HASH(blocked_ips, u32, u32);  // Memorizza gli IP bloccati
+BPF_HASH(ip_count_map, __u32, __u64, 1024);
 
-struct event_t {
-    u32 src_ip;
-    char message[256];
-};
+int xdp_firewall(struct xdp_md *ctx) {
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data = (void *)(long)ctx->data;
 
-int kprobe__tcp_v4_connect(struct pt_regs *ctx, struct sock *sk) {
-   
+    // Only IPv4 supported for this example
+    struct ethhdr *ether = data;
+    if (data + sizeof(*ether) > data_end) {
+        // Malformed Ethernet header
+        return XDP_ABORTED;
+    }
+
+    if (ether->h_proto != 0x08U) {  // htons(ETH_P_IP) -> 0x08U
+        // Non IPv4 traffic
+        return XDP_PASS;
+    }
+
+    data += sizeof(*ether);
+    struct iphdr *ip = data;
+    if (data + sizeof(*ip) > data_end) {
+        // Malformed IPv4 header
+        return XDP_ABORTED;
+    } 
+
+    __u32 src_ip = ip->saddr;
+    __u64 *req_count;
+
+    // Lookup the current request count for this IP
+    req_count = ip_count_map.lookup(&src_ip);
+    if (req_count) {
+        // Increment the request count
+        (*req_count)++;
+        if (*req_count > MAX_REQUESTS) {
+            // Drop the packet if request limit is exceeded
+            return XDP_DROP;
+        }
+    } else {
+        // Initialize the request count to 1
+        __u64 initial_count = 1;
+        ip_count_map.update(&src_ip, &initial_count);
+    }
+
+    return XDP_PASS;
 }
 """
 
 b = BPF(text=bpf_text)
 
-# Funzione per convertire un indirizzo IP da formato intero a stringa
-def inet_ntoa(addr):
-    return socket.inet_ntoa(struct.pack("!I", addr))
-
-# Callback per gestire gli eventi e stampare a terminale
-def print_event(cpu, data, size):
-    event = b["events"].event(data)
-    src_ip = inet_ntoa(event.src_ip)
-    count = b["counts"][event.src_ip].value
-    print(f"IP {src_ip} ha fatto {count} connessioni stabilite. {event.message}")
-
-# Attacca il kprobe al punto di attacco
-b.attach_kprobe(event="tcp_v4_connect", fn_name="kprobe__tcp_v4_connect")
-
-# Carica il programma XDP sull'interfaccia di rete (es. "eth0")
+# Carica il programma XDP sull'interfaccia di rete (es. "eth0") --> wlp5s0
 device = "wlp5s0"
-b.attach_xdp(device, b.load_func("xdp_drop", BPF.XDP))
+b.attach_xdp(device, b.load_func("xdp_firewall", BPF.XDP))
 
 # Stampa intestazione
 print("Monitoring for possible DDOS attacks...")
 
-# Collega la funzione di callback agli eventi
-b["events"].open_perf_buffer(print_event)
-
 # Loop infinito per continuare a leggere gli eventi
 while True:
     try:
-        b.perf_buffer_poll()
+        b.trace_print()
     except KeyboardInterrupt:
         print("Interrupted, exiting...")
         break
