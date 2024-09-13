@@ -41,6 +41,65 @@ int xdp_firewall(struct xdp_md *ctx) {
         return XDP_ABORTED;
     } 
 
+    // Solo TCP
+    if (ip->protocol != IPPROTO_TCP)
+        return XDP_PASS;
+
+    // Header TCP
+    struct tcphdr *tcp = (struct tcphdr *)(ip + 1);
+    if ((void *)(tcp + 1) > data_end)
+        return XDP_ABORTED;
+
+    // Controlla se la connessione è già stabilita (ACK set senza SYN)
+    if (tcp->ack && !tcp->syn) {
+        // Valida il cookie se necessario
+        if (!bpf_tcp_check_syncookie(ctx, (void *)(long)ip->saddr, ip->daddr, (void *)(long)tcp->source, tcp->dest)) {
+            // Cookie non valido, scarta il pacchetto
+            return XDP_DROP;
+        }
+        // Cookie valido, passa al kernel
+        return XDP_PASS;
+    }
+        
+    // Verifica se è un pacchetto SYN
+    if (tcp->syn && !tcp->ack) {
+        // Genera il SYN cookie
+        __u32 seq = bpf_tcp_gen_syncookie(ctx, (void *)(long)ip->saddr, ip->daddr, (void *)(long)tcp->source, tcp->dest);
+
+        // Se il SYN cookie non è stato generato, passiamo il pacchetto al kernel
+        if (seq == 0)
+            return XDP_PASS;
+
+        // Modifica il pacchetto in SYN-ACK
+        tcp->ack = 1; // Imposta il flag ACK
+        tcp->ack_seq = bpf_htonl(bpf_ntohl(tcp->seq) + 1); // Acknowledge il pacchetto SYN
+
+        // Imposta il numero di sequenza con il SYN cookie generato
+        tcp->seq = seq;
+
+        // Aggiorna l'header IP (swap di indirizzi IP)
+        __u32 old_saddr = ip->saddr;
+        ip->saddr = ip->daddr;
+        ip->daddr = old_saddr;
+
+        // Aggiorna l'header TCP (swap delle porte TCP)
+        __u16 old_sport = tcp->source;
+        tcp->source = tcp->dest;
+        tcp->dest = old_sport;
+
+        // Ricalcola i checksum IP e TCP
+        tcp->check = 0;
+        tcp->check = bpf_csum_diff(0, 0, (__be32 *)tcp, sizeof(*tcp), 0);
+        ip->check = 0;
+        ip->check = bpf_csum_diff(0, 0, (__be32 *)ip, sizeof(*ip), 0);
+
+        // Invia il pacchetto come risposta SYN-ACK tramite XDP_TX
+        return XDP_TX;
+    }
+
+    // Se non ci sono SYN o ACK, scarta il pacchetto
+    return XDP_DROP;
+    
     __u32 src_ip = ip->saddr;
     __u64 *req_count;
 
