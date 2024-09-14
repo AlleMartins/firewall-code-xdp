@@ -11,12 +11,10 @@ bpf_text = """
 #include <linux/ip.h>
 #include <linux/tcp.h>
 
-#define MAX_REQUESTS 15
-
 __attribute__((section("xdp"), used))
 int xdp_firewall(struct xdp_md *ctx);
 
-BPF_HASH(ip_count_map, __u32, __u64, 1024);
+BPF_HASH(ip_count_map, __u32, __u64);
 
 int xdp_firewall(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
@@ -50,77 +48,48 @@ int xdp_firewall(struct xdp_md *ctx) {
     if ((void *)(tcp + 1) > data_end)
         return XDP_ABORTED;
 
-    // Controlla se la connessione è già stabilita (ACK set senza SYN)
+    // Controlla se è un pacchetto ACK senza SYN (connessione stabilita)
     if (tcp->ack && !tcp->syn) {
-        // Valida il cookie se necessario
-        if (!bpf_tcp_check_syncookie(ctx, (void *)(long)ip->saddr, ip->daddr, (void *)(long)tcp->source, tcp->dest)) {
+        
+        // Verifica il SYN cookie
+        if (!bpf_tcp_raw_check_syncookie_ipv4(ip, tcp)) {
             // Cookie non valido, scarta il pacchetto
+            bpf_trace_printk("Blocked IP: %x\\n", ip->saddr);
             return XDP_DROP;
         }
-        // Cookie valido, passa al kernel
+
+        // Cookie valido, consenti il passaggio al kernel
         return XDP_PASS;
     }
         
     // Verifica se è un pacchetto SYN
     if (tcp->syn && !tcp->ack) {
-        // Genera il SYN cookie
-        __u32 seq = bpf_tcp_gen_syncookie(ctx, (void *)(long)ip->saddr, ip->daddr, (void *)(long)tcp->source, tcp->dest);
+        __u32 cookie_seq = bpf_tcp_raw_gen_syncookie_ipv4(ip, tcp, sizeof(*tcp));
 
-        // Se il SYN cookie non è stato generato, passiamo il pacchetto al kernel
-        if (seq == 0)
+        if (cookie_seq == 0)
             return XDP_PASS;
 
-        // Modifica il pacchetto in SYN-ACK
-        tcp->ack = 1; // Imposta il flag ACK
-        tcp->ack_seq = bpf_htonl(bpf_ntohl(tcp->seq) + 1); // Acknowledge il pacchetto SYN
+        tcp->ack = 1; 
+        tcp->ack_seq = htonl(ntohl(tcp->seq) + 1); 
+        tcp->seq = cookie_seq;
 
-        // Imposta il numero di sequenza con il SYN cookie generato
-        tcp->seq = seq;
-
-        // Aggiorna l'header IP (swap di indirizzi IP)
         __u32 old_saddr = ip->saddr;
         ip->saddr = ip->daddr;
         ip->daddr = old_saddr;
 
-        // Aggiorna l'header TCP (swap delle porte TCP)
         __u16 old_sport = tcp->source;
         tcp->source = tcp->dest;
         tcp->dest = old_sport;
 
         // Ricalcola i checksum IP e TCP
         tcp->check = 0;
-        tcp->check = bpf_csum_diff(0, 0, (__be32 *)tcp, sizeof(*tcp), 0);
         ip->check = 0;
+        // Se ci sono helper specifici per checksum TCP, usa quelli
+        tcp->check = bpf_csum_diff(0, 0, (__be32 *)tcp, sizeof(*tcp), 0);
         ip->check = bpf_csum_diff(0, 0, (__be32 *)ip, sizeof(*ip), 0);
 
-        // Invia il pacchetto come risposta SYN-ACK tramite XDP_TX
         return XDP_TX;
     }
-
-    // Se non ci sono SYN o ACK, scarta il pacchetto
-    return XDP_DROP;
-    
-    __u32 src_ip = ip->saddr;
-    __u64 *req_count;
-
-    // Lookup the current request count for this IP
-    req_count = ip_count_map.lookup(&src_ip);
-    if (req_count) {
-        // Increment the request count
-        (*req_count)++;
-        if (*req_count > MAX_REQUESTS) {
-            
-            bpf_trace_printk("Blocked IP: %x\\n", src_ip);
-
-            // Drop the packet if request limit is exceeded
-            return XDP_DROP;
-        }
-    } else {
-        // Initialize the request count to 1
-        __u64 initial_count = 1;
-        ip_count_map.update(&src_ip, &initial_count);
-    }
-
     return XDP_PASS;
 }
 """
@@ -145,7 +114,8 @@ while True:
         (task, pid, cpu, flags, ts, msg) = b.trace_fields()
         msg = msg.decode('utf-8')  # Decodifica il messaggio da bytes a stringa
         if "Blocked IP" in msg:
-            ip_num = int(msg.split("Blocked IP: ")[1], 16)
+            ip_hex = msg.split("Blocked IP: ")[1].strip()
+            ip_num = int(ip_hex, 16)
             print(f"Blocked IP: {int_to_ip(ip_num)}")
     except KeyboardInterrupt:
         print("Interrupted, exiting...")
