@@ -51,60 +51,59 @@ int xdp_firewall(struct xdp_md *ctx) {
         return XDP_DROP;
     }
 
-    // Controlla se è un pacchetto ACK senza SYN (connessione stabilita)
+    // Gestisci pacchetti SYN
+    if (tcp->syn && !tcp->ack) {
+        __u64 *syn_count = ip_syn_count.lookup(&ip->saddr);
+
+        if (syn_count) {
+            // Se è già stato inviato un SYN, blocca l'IP
+            __u64 val = 1;
+            ip_blocked_map.update(&ip->saddr, &val);
+            bpf_trace_printk("Blocked IP: %x for multiple SYNs\\n", ip->saddr);
+            return XDP_DROP;
+        } else {
+            // Se è il primo SYN, genera SYN cookie
+            __u64 initial_count = 1;
+            ip_syn_count.update(&ip->saddr, &initial_count);
+
+            __u32 cookie_seq = bpf_tcp_raw_gen_syncookie_ipv4(ip, tcp, sizeof(*tcp));
+            if (cookie_seq == 0)
+                return XDP_PASS;
+
+            bpf_trace_printk("Generated SYN cookie for IP: %x\\n", ip->saddr);
+
+            tcp->ack = 1; 
+            tcp->ack_seq = htonl(ntohl(tcp->seq) + 1); 
+            tcp->seq = cookie_seq;
+
+            __u32 old_saddr = ip->saddr;
+            ip->saddr = ip->daddr;
+            ip->daddr = old_saddr;
+
+            __u16 old_sport = tcp->source;
+            tcp->source = tcp->dest;
+            tcp->dest = old_sport;
+
+            tcp->check = 0;
+            ip->check = 0;
+            tcp->check = bpf_csum_diff(0, 0, (__be32 *)tcp, sizeof(*tcp), 0);
+            ip->check = bpf_csum_diff(0, 0, (__be32 *)ip, sizeof(*ip), 0);
+
+            return XDP_TX;
+        }
+    }
+
+    // Gestisci pacchetti ACK
     if (tcp->ack && !tcp->syn) {
         if (!bpf_tcp_raw_check_syncookie_ipv4(ip, tcp)) {
             __u64 val = 1;
             ip_blocked_map.update(&ip->saddr, &val);
-            bpf_trace_printk("Blocked IP: %x\\n", ip->saddr);
+            bpf_trace_printk("Blocked IP: %x for invalid SYN cookie\\n", ip->saddr);
             return XDP_DROP;
         }
+
+        bpf_trace_printk("Valid ACK for IP: %x\\n", ip->saddr);
         return XDP_PASS;
-    }
-
-    // Verifica se è un pacchetto SYN
-    if (tcp->syn && !tcp->ack) {
-        __u64 *syn_count = ip_syn_count.lookup(&ip->saddr);
-        if (syn_count) {
-            *syn_count += 1;
-            ip_syn_count.update(&ip->saddr, syn_count);
-
-            // if (*syn_count > MAX_SYN_COUNT) {
-            //    __u64 val = 1;
-            //    ip_blocked_map.update(&ip->saddr, &val);
-            //    // bpf_trace_printk("Blocked IP: %x\\n", ip->saddr);
-            //    return XDP_DROP;
-            // }
-        } else {
-            __u64 initial_count = 1;
-            ip_syn_count.update(&ip->saddr, &initial_count);
-        }
-
-        // Genera SYN cookie
-        __u32 cookie_seq = bpf_tcp_raw_gen_syncookie_ipv4(ip, tcp, sizeof(*tcp));
-        if (cookie_seq == 0)
-            return XDP_PASS;
-
-        bpf_trace_printk("Generated SYN cookie for IP: %x\\n", ip->saddr);
-
-        tcp->ack = 1; 
-        tcp->ack_seq = htonl(ntohl(tcp->seq) + 1); 
-        tcp->seq = cookie_seq;
-
-        __u32 old_saddr = ip->saddr;
-        ip->saddr = ip->daddr;
-        ip->daddr = old_saddr;
-
-        __u16 old_sport = tcp->source;
-        tcp->source = tcp->dest;
-        tcp->dest = old_sport;
-
-        tcp->check = 0;
-        ip->check = 0;
-        tcp->check = bpf_csum_diff(0, 0, (__be32 *)tcp, sizeof(*tcp), 0);
-        ip->check = bpf_csum_diff(0, 0, (__be32 *)ip, sizeof(*ip), 0);
-
-        return XDP_TX;
     }
 
     return XDP_PASS;
@@ -122,6 +121,8 @@ def int_to_ip(ipnum):
 
 syn_cookie_printed = set()
 already_blocked_printed = set()
+blocked_invalid_cookie_printed = set()
+valid_ack_printed = set()
 
 print("Monitoring for possible DDOS attacks...")
 
@@ -130,24 +131,37 @@ while True:
         (task, pid, cpu, flags, ts, msg) = b.trace_fields()
         msg = msg.decode('utf-8')
 
-        if "Blocked IP" in msg:
-            ip_hex = msg.split("Blocked IP: ")[1].strip()
+        # Riconosci quando un IP è stato bloccato per un SYN non valido
+        if "Blocked IP" in msg and "for invalid SYN cookie" in msg:
+            ip_hex = msg.split("Blocked IP: ")[1].split(" for invalid SYN cookie")[0].strip()
             ip_num = int(ip_hex, 16)
-            print(f"Blocked IP: {int_to_ip(ip_num)}")
+            if ip_num not in blocked_invalid_cookie_printed:
+                print(f"Blocked IP for invalid SYN cookie: {int_to_ip(ip_num)}")
+                blocked_invalid_cookie_printed.add(ip_num)
 
-        if "Generated SYN cookie for IP" in msg:
-            ip_hex = msg.split("Generated SYN cookie for IP: ")[1].strip()
+        # Riconosci quando un ACK è stato validato
+        elif "Valid ACK for IP" in msg:
+            ip_hex = msg.split("Valid ACK for IP: ")[1].strip()
             ip_num = int(ip_hex, 16)
-            if ip_num not in syn_cookie_printed:
-                print(f"Generated SYN cookie for IP: {int_to_ip(ip_num)}")
-                syn_cookie_printed.add(ip_num)
+            if ip_num not in valid_ack_printed:
+                print(f"Valid ACK for IP: {int_to_ip(ip_num)}")
+                valid_ack_printed.add(ip_num)
 
-        if "Already blocked IP" in msg:
+        # Messaggi per IP già bloccato
+        elif "Already blocked IP" in msg:
             ip_hex = msg.split("Already blocked IP: ")[1].strip()
             ip_num = int(ip_hex, 16)
             if ip_num not in already_blocked_printed:
                 print(f"Already blocked IP: {int_to_ip(ip_num)}")
                 already_blocked_printed.add(ip_num)
+
+        # Messaggi per la generazione di SYN cookie
+        elif "Generated SYN cookie for IP" in msg:
+            ip_hex = msg.split("Generated SYN cookie for IP: ")[1].strip()
+            ip_num = int(ip_hex, 16)
+            if ip_num not in syn_cookie_printed:
+                print(f"Generated SYN cookie for IP: {int_to_ip(ip_num)}")
+                syn_cookie_printed.add(ip_num)
 
     except KeyboardInterrupt:
         print("Interrupted, exiting...")
