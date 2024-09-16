@@ -6,6 +6,7 @@ import ctypes as ct
 # Carica il codice eBPF
 bpf_text = """
 #include <uapi/linux/bpf.h>
+#include <linux/bpf_common.h>
 #include <linux/in.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
@@ -15,6 +16,9 @@ BPF_HASH(ip_blocked_map, __u32, __u64);  // Mappa per IP bloccati
 BPF_HASH(ip_syn_count, __u32, __u64);    // Mappa per conteggio dei pacchetti SYN
 
 #define MAX_SYN_COUNT 5  // Soglia massima per SYN
+
+__attribute__((section("xdp"), used))
+int xdp_firewall(struct xdp_md *ctx);
 
 int xdp_firewall(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
