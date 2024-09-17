@@ -106,6 +106,13 @@ int xdp_firewall(struct xdp_md *ctx) {
             return XDP_DROP;
         }
 
+        // Il SYN cookie è valido, azzera il conteggio SYN inviati per questo IP
+        __u64 *syn_count = ip_syn_count.lookup(&src_ip);
+        if (syn_count) {
+            __u64 zero_count = 0;
+            ip_syn_count.update(&src_ip, &zero_count);  // Reset SYN count
+        }
+
         bpf_trace_printk("Valid ACK for IP: %x\\n", src_ip);
         return XDP_PASS;
     }
