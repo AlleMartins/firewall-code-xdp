@@ -71,29 +71,47 @@ int xdp_firewall(struct xdp_md *ctx) {
             ip_syn_count.update(&src_ip, &initial_count);
 
             __u32 cookie_seq = bpf_tcp_raw_gen_syncookie_ipv4(ip, tcp, sizeof(*tcp));
-            if (cookie_seq == 0)
-                return XDP_PASS;
+            if (cookie_seq == 0) {
+                bpf_trace_printk("NOT generated SYN cookie for IP: %x\\n", src_ip);
+                return XDP_PASS;  // Nessun cookie generato, passa il pacchetto
+            }
 
             bpf_trace_printk("Generated SYN cookie for IP: %x\\n", src_ip);
 
-            tcp->ack = 1; 
-            tcp->ack_seq = htonl(ntohl(tcp->seq) + 1); 
-            tcp->seq = cookie_seq;
+            // Prepara il pacchetto SYN-ACK
+            
+            unsigned char tmp_mac[ETH_ALEN];
 
-            __u32 old_saddr = ip->saddr;
+            // Inverti gli indirizzi MAC
+            __builtin_memcpy(tmp_mac, ether->h_source, ETH_ALEN);   // Salva MAC di origine temporaneamente
+            __builtin_memcpy(ether->h_source, ether->h_dest, ETH_ALEN); // MAC di destinazione in origine
+            __builtin_memcpy(ether->h_dest, tmp_mac, ETH_ALEN);     // MAC salvato come destinazione
+
+            tcp->ack = 1;
+            tcp->ack_seq = htonl(ntohl(tcp->seq) + 1);  // ACK del SYN ricevuto
+            tcp->seq = htonl(cookie_seq);  // Imposta il cookie generato come numero di sequenza
+
+            // Inverti gli indirizzi IP
+            __u32 tmp_ip = ip->saddr;
             ip->saddr = ip->daddr;
-            ip->daddr = old_saddr;
+            ip->daddr = tmp_ip;
 
-            __u16 old_sport = tcp->source;
+            // Inverti le porte TCP
+            __u16 tmp_port = tcp->source;
             tcp->source = tcp->dest;
-            tcp->dest = old_sport;
+            tcp->dest = tmp_port;
 
-            tcp->check = 0;
-            ip->check = 0;
-            tcp->check = bpf_csum_diff(0, 0, (__be32 *)tcp, sizeof(*tcp), 0);
-            ip->check = bpf_csum_diff(0, 0, (__be32 *)ip, sizeof(*ip), 0);
+            // Calcolo del checksum TCP
+            tcp->check = 0;  // Azzera il checksum TCP
+            __u32 tcp_csum = bpf_csum_diff(0, 0, (__be32 *)tcp, sizeof(*tcp), 0);
+            tcp->check = tcp_csum;
 
-            return XDP_TX;
+            // Calcolo del checksum IP
+            ip->check = 0;  // Azzera il checksum IP
+            __u32 ip_csum = bpf_csum_diff(0, 0, (__be32 *)ip, sizeof(*ip), 0);
+            ip->check = ip_csum;
+
+            return XDP_TX;  // Trasmetti il pacchetto SYN-ACK
         }
     }
 
@@ -179,6 +197,13 @@ while True:
             ip_num = int(ip_hex, 16)
             if ip_num not in syn_cookie_printed:
                 print(f"Generated SYN cookie for IP: {int_to_ip(ip_num)}")
+                syn_cookie_printed.add(ip_num)
+
+        elif "NOT generated SYN cookie for IP" in msg:
+            ip_hex = msg.split("NOT generated SYN cookie for IP: ")[1].strip()
+            ip_num = int(ip_hex, 16)
+            if ip_num not in syn_cookie_printed:
+                print(f"NOT generated SYN cookie for IP: {int_to_ip(ip_num)}")
                 syn_cookie_printed.add(ip_num)
 
     except KeyboardInterrupt:
